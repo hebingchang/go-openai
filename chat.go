@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 )
@@ -51,9 +52,25 @@ type PromptAnnotation struct {
 	ContentFilterResults ContentFilterResults `json:"content_filter_results,omitempty"`
 }
 
+type ContentType string
+
+const (
+	ContentTypeText  ContentType = "text"
+	ContentTypeImage ContentType = "image_url"
+)
+
+type Part struct {
+	Type     ContentType `json:"type"`
+	ImageUrl string      `json:"image_url,omitempty"`
+	Text     string      `json:"text,omitempty"`
+}
+
+type Parts []Part
+
 type ChatCompletionMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role         string `json:"role"`
+	Content      string `json:"content"`
+	ContentParts Parts  // note that in the final solution this would be private - its public here just to allow for go-cmp in tests bellow
 
 	// This property isn't in the official documentation, but it's in
 	// the documentation for the official library for python:
@@ -68,6 +85,73 @@ type ChatCompletionMessage struct {
 
 	// For Role=tool prompts this should be set to the ID given in the assistant's prior request to call a tool.
 	ToolCallID string `json:"tool_call_id,omitempty"`
+}
+
+func (m *ChatCompletionMessage) AppendPart(p Part) {
+	if p.Type == ContentTypeText && m.Content == "" && len(m.ContentParts) == 0 {
+		m.Content = p.Text
+		return
+	}
+	m.ContentParts = append(m.ContentParts, p)
+}
+func (m *ChatCompletionMessage) NParts() int     { return len(m.ContentParts) }
+func (m *ChatCompletionMessage) Part(n int) Part { return m.ContentParts[n] }
+func (m *ChatCompletionMessage) Parts() []Part {
+	return append(make([]Part, 0, len(m.ContentParts)), m.ContentParts...)
+}
+
+func (ps Parts) MarshalJSON() ([]byte, error) {
+	if len(ps) == 0 {
+		return []byte(`""`), nil
+	}
+	cc := []Part(ps)
+	if len(cc) == 1 && cc[0].Type == "text" {
+		if cc[0].Text != "" {
+			return json.Marshal(cc[0].Text)
+		}
+		return []byte(`""`), nil
+	}
+	return json.Marshal([]Part(cc))
+}
+
+func (ps *Parts) UnmarshalJSON(bs []byte) error {
+	if string(bs) == `""` {
+		*ps = nil
+		return nil
+	}
+	if bs[0] == '"' && bs[len(bs)-1] == '"' {
+		var s string
+		err := json.Unmarshal(bs, &s)
+		if err != nil {
+			return err
+		}
+		*ps = Parts{{Type: ContentTypeText, Text: s}}
+		return nil
+	}
+	var parts []Part
+	err := json.Unmarshal(bs, &parts)
+	if err != nil {
+		return err
+	}
+	*ps = parts
+	return nil
+}
+
+func (m ChatCompletionMessage) MarshalJSON() ([]byte, error) {
+	msg := struct {
+		Role  string `json:"role"`
+		Parts Parts  `json:"content"`
+	}{
+		Role: m.Role,
+	}
+	if m.Content != "" {
+		msg.Parts = make([]Part, 0, 1+len(m.ContentParts))
+		msg.Parts = append(msg.Parts, Part{Type: ContentTypeText, Text: m.Content})
+	} else {
+		msg.Parts = make([]Part, 0, len(m.ContentParts))
+	}
+	msg.Parts = append(msg.Parts, m.ContentParts...)
+	return json.Marshal(msg)
 }
 
 type ToolCall struct {
